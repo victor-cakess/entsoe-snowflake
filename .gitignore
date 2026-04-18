@@ -3,3 +3,4 @@ venv/
 check.ipynb
 data/
 .ipynb_checkpoints
+logs/

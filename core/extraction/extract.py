@@ -4,29 +4,62 @@ import os
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
+import threading
+import time
 from datetime import datetime
 from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from tqdm import tqdm
+import time
 
 load_dotenv()
 
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# setup logging to file only
+log_dir = os.path.join(BASE_DIR, "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file)]
 )
 logger = logging.getLogger(__name__)
 
 API_TOKEN = os.getenv("API_TOKEN")
 BASE_URL = "https://web-api.tp.entsoe.eu/api"
 
-NS_GL   = {"ns": "urn:iec62325.351:tc57wg16:451-6:generationloaddocument:3:0"}
-NS_PUB  = {"ns": "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"}
+NS_GL  = {"ns": "urn:iec62325.351:tc57wg16:451-6:generationloaddocument:3:0"}
+NS_PUB = {"ns": "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"}
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 ZONES = {
     "10Y1001A1001A82H": "DE-LU",
+    "10YDK-1--------W": "DK1",
+    "10YDK-2--------M": "DK2",
+    "10YFI-1--------U": "FI",
     "10YFR-RTE------C": "FR",
+    "10YNL----------L": "NL",
+    "10YBE----------2": "BE",
+    "10YCH-SWISSGRIDZ": "CH",
+    "10YAT-APG------L": "AT",
+    "10YES-REE------0": "ES",
+    "10YPT-REN------W": "PT",
+    "10YGR-HTSO-----Y": "GR",
+    "10YPL-AREA-----S": "PL",
+    "10YCZ-CEPS-----N": "CZ",
+    "10YSK-SEPS-----K": "SK",
+    "10YHU-MAVIR----U": "HU",
+    "10YRO-TEL------P": "RO",
+    "10YSI-ELES-----O": "SI",
+    "10YHR-HEP------M": "HR",
+    "10YMK-MEPSO----8": "MK",
+    "10YLV-1001A00074": "LV",
+    "10YLT-1001A0008Q": "LT",
 }
 
 PSR_TYPES = {
@@ -52,18 +85,29 @@ PSR_TYPES = {
 
 
 def month_boundaries(year, month):
-    start = f"{year}{month:02d}010000"
-    last_day = monthrange(year, month)[1]
     next_month = month + 1 if month < 12 else 1
     next_year = year if month < 12 else year + 1
+    start = f"{year}{month:02d}010000"
     end = f"{next_year}{next_month:02d}010000"
     return start, end
 
 
-def fetch(params):
-    resp = requests.get(BASE_URL, params={"securityToken": API_TOKEN, **params})
-    resp.raise_for_status()
-    return resp
+def fetch(params, retries=3):
+    for attempt in range(retries):
+        try:
+            resp = requests.get(BASE_URL, params={"securityToken": API_TOKEN, **params}, timeout=30)
+            if resp.status_code == 429:
+                wait = 2 ** attempt * 10
+                logger.warning(f"Rate limited, waiting {wait}s before retry")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            wait = 2 ** attempt
+            logger.warning(f"Request failed (attempt {attempt + 1}/{retries}): {e} — retrying in {wait}s")
+            time.sleep(wait)
+    raise Exception(f"All {retries} attempts failed for params: {params}")
 
 
 def parse_gl(response, zone_name, value_col):
@@ -131,7 +175,6 @@ def parse_generation(response, zone_name, forecast=False):
 
 
 def fetch_load(zone_code, zone_name, period_start, period_end):
-    logger.info(f"{zone_name} - fetching load (realized + forecast)")
     frames = []
     for process_type, col in [("A16", "realized_mw"), ("A01", "forecast_mw")]:
         resp = fetch({
@@ -142,14 +185,12 @@ def fetch_load(zone_code, zone_name, period_start, period_end):
             "periodEnd": period_end,
         })
         df = parse_gl(resp, zone_name, col)
-        frames.append(df)
         logger.info(f"{zone_name} - load {col}: {len(df)} rows")
-    merged = frames[0].merge(frames[1], on=["timestamp", "zone"], how="outer")
-    return merged
+        frames.append(df)
+    return frames[0].merge(frames[1], on=["timestamp", "zone"], how="outer")
 
 
 def fetch_prices(zone_code, zone_name, period_start, period_end):
-    logger.info(f"{zone_name} - fetching prices")
     resp = fetch({
         "documentType": "A44",
         "in_Domain": zone_code,
@@ -163,7 +204,6 @@ def fetch_prices(zone_code, zone_name, period_start, period_end):
 
 
 def fetch_generation(zone_code, zone_name, period_start, period_end):
-    logger.info(f"{zone_name} - fetching generation (actual + wind/solar forecast)")
     resp_actual = fetch({
         "documentType": "A75",
         "processType": "A16",
@@ -184,52 +224,145 @@ def fetch_generation(zone_code, zone_name, period_start, period_end):
     df_forecast = parse_generation(resp_forecast, zone_name, forecast=True)
     logger.info(f"{zone_name} - generation forecast: {len(df_forecast)} rows")
 
-    merged = df_actual.merge(df_forecast, on=["timestamp", "zone"], how="outer")
-    return merged
+    if df_actual.empty:
+        return df_forecast
+    if df_forecast.empty:
+        return df_actual
+    return df_actual.merge(df_forecast, on=["timestamp", "zone"], how="outer")
+
+_file_locks = {
+    "load": threading.Lock(),
+    "prices": threading.Lock(),
+    "generation": threading.Lock(),
+}
 
 
-def write_parquet(df, dataset, year, month):
+def append_parquet(df, dataset, year, month, zone_name):
+    if df.empty:
+        logger.warning(f"{zone_name} - {dataset}: no data available")
+        return
     path = os.path.join(BASE_DIR, "data", dataset, f"year={year}", f"month={month:02d}", f"{dataset}.parquet")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_parquet(path, index=False)
-    logger.info(f"Written {len(df)} rows to {path}")
+    with _file_locks[dataset]:
+        if os.path.exists(path):
+            existing = pd.read_parquet(path)
+            existing = existing[existing["zone"] != zone_name]
+            df = pd.concat([existing, df], ignore_index=True)
+        df = df.drop_duplicates(subset=["timestamp", "zone"])
+        df.to_parquet(path, index=False)
+    logger.info(f"{zone_name} - {dataset}: written to disk")
 
 
-def append_parquet(df, dataset, year, month):
-    path = os.path.join(BASE_DIR, "data", dataset, f"year={year}", f"month={month:02d}", f"{dataset}.parquet")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path):
-        existing = pd.read_parquet(path)
-        zone = df["zone"].iloc[0]
-        existing = existing[existing["zone"] != zone]
-        df = pd.concat([existing, df], ignore_index=True)
-    df.to_parquet(path, index=False)
-    logger.info(f"{dataset}: {len(df)} total rows written")
-    
-
-def process_month(year, month):
-    period_start, period_end = month_boundaries(year, month)
-    logger.info(f"Processing {year}-{month:02d} | period: {period_start} → {period_end}")
-
-    for zone_code, zone_name in ZONES.items():
+def zone_already_processed(zone_name, year, month):
+    for dataset in ["load", "prices", "generation"]:
+        path = os.path.join(BASE_DIR, "data", dataset, f"year={year}", f"month={month:02d}", f"{dataset}.parquet")
+        if not os.path.exists(path):
+            return False
         try:
-            load_df = fetch_load(zone_code, zone_name, period_start, period_end)
-            prices_df = fetch_prices(zone_code, zone_name, period_start, period_end)
-            gen_df = fetch_generation(zone_code, zone_name, period_start, period_end)
+            with _file_locks[dataset]:
+                existing = pd.read_parquet(path)
+            if zone_name not in existing["zone"].values:
+                return False
+        except Exception:
+            return False
+    return True
 
-            append_parquet(load_df, "load", year, month)
-            append_parquet(prices_df, "prices", year, month)
-            append_parquet(gen_df, "generation", year, month)
 
-            logger.info(f"{zone_name} - written to disk")
-        except Exception as e:
-            logger.error(f"{zone_name} - failed: {e}")
+def process_zone(zone_code, zone_name, period_start, period_end, year, month):
+    if zone_already_processed(zone_name, year, month):
+        logger.info(f"{zone_name} - already processed, skipping")
+        return True
+    try:
+        logger.info(f"{zone_name} - starting")
+        load_df = fetch_load(zone_code, zone_name, period_start, period_end)
+        prices_df = fetch_prices(zone_code, zone_name, period_start, period_end)
+        gen_df = fetch_generation(zone_code, zone_name, period_start, period_end)
+        append_parquet(load_df, "load", year, month, zone_name)
+        append_parquet(prices_df, "prices", year, month, zone_name)
+        append_parquet(gen_df, "generation", year, month, zone_name)
+        logger.info(f"{zone_name} - done")
+        return True
+    except Exception as e:
+        import traceback
+        logger.error(f"{zone_name} - failed: {traceback.format_exc()}")
+        return False
+
+
+def process_month(year, month, max_workers=15):
+    period_start, period_end = month_boundaries(year, month)
+    logger.info(f"Processing {year}-{month:02d} | period: {period_start} → {period_end} | workers: {max_workers}")
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_zone, zone_code, zone_name, period_start, period_end, year, month): zone_name
+            for zone_code, zone_name in ZONES.items()
+        }
+        for future in as_completed(futures):
+            zone_name = futures[future]
+            results[zone_name] = future.result()
+
+    failed = [z for z, ok in results.items() if not ok]
+    logger.info(f"{year}-{month:02d} done — {len(results) - len(failed)}/{len(results)} succeeded")
+    return failed
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--year", type=int, required=True)
-    parser.add_argument("--month", type=int, required=True)
+    parser.add_argument("--year", type=int)
+    parser.add_argument("--month", type=int)
+    parser.add_argument("--backfill", action="store_true")
+    parser.add_argument("--start", type=str, help="YYYY-MM")
+    parser.add_argument("--end", type=str, help="YYYY-MM")
+    parser.add_argument("--workers", type=int, default=15)
     args = parser.parse_args()
 
-    process_month(args.year, args.month)
+    if args.backfill:
+        start = datetime.strptime(args.start, "%Y-%m")
+        end = datetime.strptime(args.end, "%Y-%m")
+
+        months = []
+        current = start
+        while current <= end:
+            months.append((current.year, current.month))
+            month = current.month + 1 if current.month < 12 else 1
+            year = current.year if current.month < 12 else current.year + 1
+            current = datetime(year, month, 1)
+
+        all_failures = {}
+        backfill_start = time.time()
+
+        with tqdm(total=len(months), unit="month", ncols=80) as pbar:
+            for i, (year, month) in enumerate(months):
+                month_label = f"{year}-{month:02d}"
+                pbar.set_description(f"Processing {month_label}")
+
+                t0 = time.time()
+                failed = process_month(year, month, args.workers)
+                elapsed = time.time() - t0
+
+                if failed:
+                    all_failures[month_label] = failed
+
+                pbar.update(1)
+
+                # estimate remaining time
+                done = i + 1
+                avg = (time.time() - backfill_start) / done
+                remaining = avg * (len(months) - done)
+                pbar.set_postfix({
+                    "last": f"{elapsed:.0f}s",
+                    "eta": f"{remaining/60:.1f}min"
+                })
+
+        print(f"\nBackfill complete in {(time.time() - backfill_start)/60:.1f} min")
+        print(f"Log file: {log_file}")
+
+        if all_failures:
+            print("\nZones with missing data:")
+            for month_key, zones in all_failures.items():
+                print(f"  {month_key}: {zones}")
+        else:
+            print("All zones succeeded.")
+    else:
+        process_month(args.year, args.month, args.workers)
