@@ -4,3 +4,8 @@ check.ipynb
 data/
 .ipynb_checkpoints
 logs/
+terraform.tfstate
+.terraform/
+.terraform.lock.hcl
+terraform/terraform.tfvars
+CLAUDE.md
